@@ -12,6 +12,13 @@ dry_run: false
 rl:
   seed: null
 
+  # VCBM (Visual Causal Chain Bookmarking) credit assignment — see CLAUDE.md.
+  # Always on for rollouts with at least one bookmarked (state-changing) turn.
+  vcc_alpha: 0.1 # floor weight for non-retrieved/non-bookmarked turns
+  vcc_top_k: 4 # Eq. 8: number of causal events retrieved from the episodic memory bank
+  vcc_temperature: 1.0 # Eq. 9: retrieval softmax temperature
+  vcc_blend_alpha: 1.0 # Eq. 14: VCBM/LOOP blend coefficient (1.0 = pure VCBM)
+
   fsdp: True
 
   cloud_path: experiments/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}/
@@ -51,7 +58,7 @@ rl:
 
 wandb:
   enable: True
-  entity: phi-agents
-  project: default_project
+  entity: null # set to your W&B entity, or leave null to use your default entity
+  project: vcbm-loop
   run: null # if null, this is generated automatically
   group: null # if null, the group is constructed from task name and other attributes

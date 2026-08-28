@@ -1,5 +1,7 @@
 # Reinforcement Learning for Long-Horizon Interactive LLM Agents
 
+> **This is a fork of [apple/ml-loop](https://github.com/apple/ml-loop)** that adds **Visual Causal-chain Bookmarking (VCBM)**, an optional credit-assignment mechanism layered on top of LOOP. See [VCBM: retrieval-weighted credit assignment](#vcbm-retrieval-weighted-credit-assignment) below for what it does, how to enable it, and current results. Everything above that section is upstream Apple documentation, kept as-is.
+
 This repository contains a reference implementation of **Leave-One-Out PPO (LOOP)**, as well as training and evaluation code for the [AppWorld](https://appworld.dev/) benchmark.
 
 This software project accompanies the research paper, <br/>**[Reinforcement Learning for Long-Horizon Interactive LLM Agents](https://arxiv.org/abs/2502.01600)**,
@@ -158,7 +160,57 @@ Such configuration is useful for debugging on a 80GB GPU (A100, H100) with small
 
 * Specify `rl/gpu_allocation=one_inference_one_learning` for efficient debugging on a 2-GPU machine.
 
+## VCBM: retrieval-weighted credit assignment
+
+LOOP assigns one scalar advantage to every token in a rollout, uniformly, regardless of which turn actually mutated task state. **Visual Causal-chain Bookmarking (VCBM)** is an optional add-on that instead concentrates credit on the turns that plausibly caused the outcome, blended with the standard LOOP advantage.
+
+Concretely, VCBM:
+
+1. Flags a turn as a **bookmark** if it issued a state-mutating API call (POST/PUT/DELETE/PATCH), via a small patch to the AppWorld server (`scripts/patch_appworld_server.py`) that reports whether each executed call was a bookmark.
+2. Builds a per-episode **memory bank** of bookmarked turns, keyed by a hashing-trick embedding of the turn's tool-execution-result text (`phi_agents/rl/vcc/state_encoder.py`).
+3. At the end of the episode, retrieves the top-k bookmarked turns most similar to the terminal observation by cosine similarity, and weights them with a temperature-scaled softmax (`phi_agents/rl/vcc/memory_bank.py`). Falls back to flat weighting over all bookmarks when there are fewer bookmarks than k.
+4. Converts those retrieval weights into per-token credit weights, with a floor `alpha` so non-bookmarked turns still receive some gradient signal (`phi_agents/rl/vcc/credit_weights.py`).
+5. Blends the resulting per-token advantage with plain LOOP's uniform advantage: `advantage = (1 - alpha_blend) * loop_advantage + alpha_blend * vcbm_advantage`, in `_vcbm_weights` / `_loss` in `phi_agents/rl/train.py`.
+
+VCBM is fully optional and off by default in behavior: it only activates for rollouts where `rollout.turn_bookmarks` is populated and non-empty, so plain LOOP runs are unaffected unless a scenario runner is wired up to populate bookmarks.
+
+### Enabling VCBM
+
+New config keys (all under the top-level Hydra config, alongside the existing `rl.params.*` keys):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `vcc_alpha` | `0.1` | Background credit floor for non-bookmarked/non-retrieved turns. |
+| `vcc_top_k` | `4` | Number of bookmarked turns to retrieve by cosine similarity. |
+| `vcc_temperature` | `1.0` | Softmax temperature over retrieved-turn similarities. |
+| `vcc_blend_alpha` | `1.0` | Blend weight between plain LOOP (`0.0`) and pure VCBM (`1.0`) advantage. |
+
+To reproduce something close to the dissertation's AppWorld configuration (`vcc_temperature=0.5`, `vcc_top_k=6`, `vcc_alpha=0.05`, `vcc_blend_alpha=1.0`), add the corresponding overrides to the training command in [Model Training](#model-training) or [Debugging](#debugging) above. The AppWorld server must be patched first:
+
+```bash
+python -m scripts.patch_appworld_server
+```
+
+### Results and current status
+
+VCBM was developed and evaluated as part of an MSc dissertation, in two settings:
+
+- **A fully observed tabular MDP** (not part of this repository), where VCBM's causal-discovery mechanism was tested against ground truth across 20 seeds and found to recover the correct causal structure in all 20, converging in roughly half the episodes of a return-redistribution baseline (Mann-Whitney U=19, p<0.001).
+- **AppWorld, using this codebase**: VCBM-blended LOOP vs. plain LOOP, identical Qwen2.5-7B-Instruct/LoRA/FSDP2 configuration, 200 iterations. Task success rate improved from 35.4% (LOOP) to 45.8% (VCBM-blended), with 18.8% fewer output tokens per rollout and a lower final-step maximum importance weight.
+
+**This AppWorld result is single-seed**, run once per arm due to limited GPU availability, and has not been tested for statistical significance across multiple seeds. It should be read as a directional signal that the mechanism is compatible with an improvement at this scale, not as a confirmed effect. A second seed (or several) under this repository's standard 8-GPU configuration would be the natural way to firm this up, and is a good starting point for anyone who wants to build on this fork.
+
+### Tests
+
+```bash
+python -m scripts.test_vcc_pipeline
+```
+
+Covers the credit-weight computation, retrieval and softmax weighting, the alpha-blend boundary conditions (`alpha_blend=0` recovers plain LOOP exactly, `alpha_blend=1` recovers pure VCBM), the degenerate few-bookmarks fallback, and (if `APPWORLD_ROOT` is set) the patched server endpoint end-to-end.
+
 ## Citation
+
+If you use LOOP, please cite the original paper:
 
 ```bibtex
 @inproceedings{chen2025loop,

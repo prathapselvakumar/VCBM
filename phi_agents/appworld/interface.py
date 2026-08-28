@@ -125,8 +125,8 @@ class AppWorldInterface:
         """
         self._server: subprocess.Popen[bytes] | None = None
         self._docker: bool = False  # avoiding docker within docker
-        self._max_wait_tries: int = 5
-        self._wait_seconds: float = 1.0
+        self._max_wait_tries: int = 60   # increased: AppWorld dataset load takes 60-120s on compute nodes
+        self._wait_seconds: float = 2.0   # 2s between attempts → 120s total wait per server
         self._stdout_to_devnull = stdout_to_devnull
         self._init_server()
         self.timeout_seconds = timeout_seconds
@@ -286,9 +286,10 @@ class AppWorldInterface:
         try:
             response.raise_for_status()
         except requests.HTTPError as exception:
-            logger.exception(
-                f"AppWorld remote environment call to method '{method_name}' failed: {response.text}."
-            )
+            if response.status_code != 404:
+                logger.exception(
+                    f"AppWorld remote environment call to method '{method_name}' failed: {response.text}."
+                )
             raise exception
 
         return response.json()["output"]
@@ -306,6 +307,30 @@ class AppWorldInterface:
         # self.environment_io.append({"input": code, "output": message})
         self.executed_code.append(code)
         return cast(str, message)
+
+    def execute_with_bookmark(self, code: str) -> tuple[str, bool]:
+        """
+        Execute code and detect whether it produced a visual bookmark.
+
+        Args:
+            code: Python code block to execute
+
+        Returns:
+            output: execution result string
+            is_bookmark: True if this turn caused a persistent state change
+        """
+        self.raise_if_server_closed()
+        try:
+            res = self._remote_environment_call("execute_with_bookmark", code=code)
+            self.executed_code.append(code)
+            return res["output"], res["is_bookmark"]
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                output = self.execute(code)
+                return output, False
+            raise AppWorldExecutionError from e
+        except Exception as e:
+            raise AppWorldExecutionError from e
 
     def get_state(self) -> tuple[str, str, Sequence[str]]:
         assert self._task_id is not None
@@ -419,6 +444,17 @@ class AppWorldInterface:
             logger.exception(
                 f"SIGINT for AppWorld server process {self.remote_environment_url} failed to terminate the process."
             )
-            force_stop_appworld_environment_server(self.server)
+            try:
+                force_stop_appworld_environment_server(self.server)
+            except Exception:
+                # SIGKILL can't interrupt a process stuck in uninterruptible I/O wait
+                # (e.g. a stalled scratch-filesystem call), so popen.wait() can still time
+                # out here. Log and move on rather than crash the whole rank over one
+                # leaked subprocess -- the caller (restart()) will spin up a fresh server.
+                logger.exception(
+                    f"SIGKILL for AppWorld server process {self.remote_environment_url} "
+                    "also failed to terminate the process within the timeout; leaking it "
+                    "and continuing."
+                )
         self._server = None
         self._task_id = None

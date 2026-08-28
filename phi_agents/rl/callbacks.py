@@ -3,11 +3,12 @@
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.
 #
 
+import time
 from pathlib import Path
 from typing import Any
 
 import ray
-from ray.exceptions import RayActorError
+from ray.exceptions import GetTimeoutError, RayActorError
 
 from phi_agents.rl.eval import EvalWorker
 from phi_agents.rl.train import RLOOTrainer
@@ -30,6 +31,15 @@ class Callback:
         """
         pass
 
+    def new_rollouts_ready(self) -> bool:
+        """
+        Non-blocking poll for whether before_new_rollouts()'s work has completed.
+        Called in a loop (with a NCCL barrier in between iterations) rather than
+        blocking directly, so a slow/stuck task on rank 0 can't trip other ranks'
+        collective watchdog. Return True once it's safe to swap in the new LoRA adapter.
+        """
+        return True
+
     def after_iteration(self, iteration: int) -> None:
         pass
 
@@ -48,6 +58,14 @@ class CallbackList:
 
         return wrapper
 
+    def new_rollouts_ready(self) -> bool:
+        return all(cb.new_rollouts_ready() for cb in self._callbacks)
+
+
+EVAL_FUTURE_TIMEOUT_S = 30 * 60  # a healthy eval is smaller than a training iteration; treat anything
+# past this as a wedged eval actor (e.g. its AppWorld server subprocess is stuck) rather than block
+# the training loop's rollout-ready poll forever.
+
 
 class EvalCallback(Callback):
     def __init__(
@@ -64,6 +82,7 @@ class EvalCallback(Callback):
 
         self._eval_actor: ray.actor.ActorHandle[Any] | None = None
         self._eval_future: ray.ObjectRef | None = None
+        self._eval_future_started_at: float | None = None
 
     def _start_actor(self) -> None:
         logger.info("Creating new EvalWorker actor...")
@@ -74,21 +93,44 @@ class EvalCallback(Callback):
             self._start_actor()
             return
 
+        # Bound this: ping.remote() queues behind any in-flight eval() call on the
+        # same (single-threaded) actor, so a wedged eval() would otherwise block this
+        # ray.get() forever -> rank 0 never reaches the next NCCL collective, and since
+        # it's not inside torch.distributed there's no watchdog to catch it.
         try:
-            ray.get(self._eval_actor.ping.remote())
-        except RayActorError:
-            logger.warning("EvalWorker actor is dead -> restarting...")
+            ray.get(self._eval_actor.ping.remote(), timeout=30)
+        except (RayActorError, GetTimeoutError):
+            logger.warning("EvalWorker actor is dead or unresponsive -> restarting...")
             self._start_actor()
         except Exception as e:
             logger.exception(f"Unexpected error pinging EvalWorker: {e}")
             self._start_actor()
 
-    def _await_completion(self) -> None:
+    def _poll_completion(self) -> bool:
+        """Non-blocking check of self._eval_future. Returns True once it's resolved
+        (or there's nothing to wait for)."""
         if self._eval_future is None:
-            return
+            return True
+
+        done, _ = ray.wait([self._eval_future], timeout=0)
+        if not done:
+            elapsed = time.monotonic() - (self._eval_future_started_at or time.monotonic())
+            if elapsed > EVAL_FUTURE_TIMEOUT_S:
+                logger.warning(
+                    f"Eval task exceeded {EVAL_FUTURE_TIMEOUT_S}s ({elapsed:.0f}s elapsed) -> "
+                    "treating EvalWorker as wedged and restarting actor."
+                )
+                try:
+                    ray.kill(self._eval_actor)
+                except RayActorError:
+                    pass
+                self._start_actor()
+                self._eval_future = None
+                self._eval_future_started_at = None
+                return True
+            return False
 
         try:
-            logger.info("Waiting for Ray eval task to complete...")
             ray.get(self._eval_future)
             logger.info("Eval task completed.")
         except RayActorError:
@@ -98,6 +140,8 @@ class EvalCallback(Callback):
             logger.exception(f"Eval failed: {e}")
         finally:
             self._eval_future = None
+            self._eval_future_started_at = None
+        return True
 
     def before_iteration(self, iteration: int, last_checkpoint_local_path: Path | None) -> None:
         cfg = self._algo._cfg
@@ -115,12 +159,18 @@ class EvalCallback(Callback):
         assert self._eval_actor is not None, f"{self._eval_actor=}"
         try:
             self._eval_future = self._eval_actor.eval.remote(last_checkpoint_local_path)
+            self._eval_future_started_at = time.monotonic()
         except RayActorError:
             logger.exception(f"Could not start eval for {last_checkpoint_local_path=}")
 
     def before_new_rollouts(self) -> None:
-        # Make sure eval doesn't overlap LoRA swapping
-        self._await_completion()
+        # Make sure eval doesn't overlap LoRA swapping. Actual waiting happens via
+        # new_rollouts_ready(), polled from the train loop so other ranks aren't
+        # blocked on a NCCL collective for however long eval takes.
+        pass
+
+    def new_rollouts_ready(self) -> bool:
+        return self._poll_completion()
 
     def shutdown(self) -> None:
         if self._eval_actor is not None:

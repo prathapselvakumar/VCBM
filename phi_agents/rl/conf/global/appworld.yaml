@@ -49,4 +49,4 @@ rl:
               mode: eval
 
 wandb:
-  project: appworld_rl
+  project: Dissertation

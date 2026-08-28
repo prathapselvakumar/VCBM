@@ -132,6 +132,7 @@ def convert_rollout_to_episode(
         n_execution_failed=rollout.appworld_rollout_data.n_execution_failed,
         n_no_code_found=rollout.appworld_rollout_data.n_no_code_found,
         cancelled=False,
+        turn_bookmarks=getattr(rollout, "turn_bookmarks", []),
     )
 
 

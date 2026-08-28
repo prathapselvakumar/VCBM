@@ -22,6 +22,12 @@ re_checkpoint = re.compile(PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
 
 DONE_FILENAME = "done.txt"
 
+# Bound how long we'll wait for the background uploader (fu.copy of a checkpoint dir,
+# e.g. shutil.copytree on a shared filesystem) before treating it as wedged. A stalled
+# scratch-filesystem copy would otherwise block done_event.wait() forever with no
+# further log output, silently hanging the whole training run.
+UPLOAD_TIMEOUT_S = 1800.0
+
 
 def checkpoint_name(iterations_completed: int) -> str:
     return f"{PREFIX_CHECKPOINT_DIR}-{iterations_completed}"
@@ -148,19 +154,31 @@ class CloudCheckpointer:
 
     def sync(self) -> None:
         if self._upload_running and self._done_event is not None:
-            self._done_event.wait()
+            if not self._done_event.wait(timeout=UPLOAD_TIMEOUT_S):
+                print(
+                    f"Checkpoint uploader did not finish within {UPLOAD_TIMEOUT_S}s -> "
+                    "killing and restarting it. The wedged checkpoint may be incomplete "
+                    "on the cloud path."
+                )
+                self._kill_proc()
             self._done_event.clear()
             self._upload_running = False
+
+    def _kill_proc(self) -> None:
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.join()
+            self._proc = None
 
     def on_save(self) -> None:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
         if self._local_rank == 0:
+            self.sync()
             self._init_proc(self._local_path)
             assert self._start_event is not None
             assert self._done_event is not None
-            self.sync()
 
             self._upload_running = True
             self._start_event.set()

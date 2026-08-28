@@ -9,10 +9,12 @@ import itertools
 import json
 import math
 import os
+import signal
 import sys
 import tempfile
+import time
 from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -448,13 +450,27 @@ class RLOOTrainer:
                 lora_dir.mkdir(parents=True, exist_ok=True)
 
                 self._rank0_logger.info(f"Saving LORA adapter...")
-                unwrapped.save_pretrained(
-                    lora_dir,
-                    is_main_process=True,
-                    save_function=self._accelerator.save,
-                    state_dict=lora_state_dict,
-                    safe_serialization=True,
-                )
+                # save_pretrained() is a plain disk write (no NCCL collective), so a
+                # stalled scratch filesystem can't be caught by NCCL_TIMEOUT the way a
+                # cross-rank desync would be -- all ranks would reach wait_for_everyone()
+                # together and just sit there. Bound it explicitly and fail fast instead.
+                save_timeout_s = int(os.environ.get("LORA_SAVE_TIMEOUT", 3600))
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="lora_save") as ex:
+                    save_future = ex.submit(
+                        unwrapped.save_pretrained,
+                        lora_dir,
+                        is_main_process=True,
+                        save_function=self._accelerator.save,
+                        state_dict=lora_state_dict,
+                        safe_serialization=True,
+                    )
+                    try:
+                        save_future.result(timeout=save_timeout_s)
+                    except FutureTimeoutError:
+                        raise TimeoutError(
+                            f"Saving LORA adapter to {lora_dir} did not complete within "
+                            f"{save_timeout_s}s (LORA_SAVE_TIMEOUT) -- treating as stuck."
+                        ) from None
                 self._accelerator.wait_for_everyone()
                 self._rank0_logger.info(f"Saving LORA adapter...Done!")
         else:
@@ -842,6 +858,62 @@ class RLOOTrainer:
         )
         return loss, debug_info
 
+    def _vcbm_weights(
+        self, rollout: TrainingRollout, n_output_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Compute the VCBM per-token credit weights for a rollout (paper Section 3.2-3.3).
+
+        Builds an episodic memory bank from bookmarked turns, retrieves the top-k events most
+        similar to the terminal observation, and maps the resulting softmax weights to
+        per-token weights. Falls back to the flat alpha-floor weighting (all bookmarks
+        weighted equally) when there are too few bookmarked turns for retrieval to be
+        meaningful, since "retrieve top-k of fewer than k" degenerates to "use all bookmarks".
+        """
+        from phi_agents.rl.type_defs import IPythonMessage
+        from phi_agents.rl.vcc.credit_weights import (
+            compute_credit_weights,
+            compute_retrieval_credit_weights,
+        )
+        from phi_agents.rl.vcc.memory_bank import build_memory_bank, retrieve_and_weight
+
+        turn_bookmarks = cast(list[bool], rollout.turn_bookmarks)  # type: ignore[attr-defined]
+        turn_token_spans = cast(
+            list[tuple[int, int]], rollout.turn_token_spans  # type: ignore[attr-defined]
+        )
+        alpha = self._cfg.get("vcc_alpha", 0.1)
+        top_k = self._cfg.get("vcc_top_k", 4)
+
+        ipython_contents = [msg.content for msg in rollout.messages if isinstance(msg, IPythonMessage)]
+        turn_observations = [
+            ipython_contents[i] if i < len(ipython_contents) else "" for i in range(len(turn_bookmarks))
+        ]
+        terminal_observation = ipython_contents[-1] if ipython_contents else ""
+        turn_returns = [rollout.ret] * len(turn_bookmarks)
+
+        memory = build_memory_bank(turn_bookmarks, turn_observations, turn_returns)
+
+        if len(memory) > top_k:
+            turn_weights = retrieve_and_weight(
+                memory,
+                terminal_observation,
+                top_k=top_k,
+                temperature=self._cfg.get("vcc_temperature", 1.0),
+            )
+            weights = compute_retrieval_credit_weights(
+                turn_weights, turn_token_spans, alpha=alpha, device=device
+            )
+        else:
+            weights = compute_credit_weights(
+                turn_bookmarks, turn_token_spans, alpha=alpha, device=device
+            )
+
+        if len(weights) > n_output_tokens:
+            weights = weights[:n_output_tokens]
+        elif len(weights) < n_output_tokens:
+            padding = torch.full((n_output_tokens - len(weights),), alpha, device=device)
+            weights = torch.cat([weights, padding])
+        return weights
+
     def _loss(
         self,
         model: ModelType,
@@ -858,7 +930,16 @@ class RLOOTrainer:
         assert new_log_probs.shape == (n_tokens,)
         tokens = tokens.cpu()
 
-        advantage_estimates = torch.tensor(monte_carlo_advantage, device=new_log_probs.device)
+        if hasattr(rollout, "turn_bookmarks") and any(rollout.turn_bookmarks):
+            bookmark_weights = self._vcbm_weights(rollout, n_output_tokens, new_log_probs.device)
+            alpha_blend = self._cfg.get("vcc_blend_alpha", 1.0)
+            loop_adv = torch.full_like(bookmark_weights, monte_carlo_advantage)
+            vcbm_adv = (
+                torch.tensor(monte_carlo_advantage, device=new_log_probs.device) * bookmark_weights
+            )
+            advantage_estimates = (1 - alpha_blend) * loop_adv + alpha_blend * vcbm_adv
+        else:
+            advantage_estimates = torch.tensor(monte_carlo_advantage, device=new_log_probs.device)
 
         # compute importance weight
         new_log_probs_output_only = new_log_probs[is_output]
@@ -1510,6 +1591,25 @@ class RLOOTrainer:
                     f"CUDA mem reserved {torch.cuda.memory_reserved() / 1024**3:.1f} GB"
                 )
 
+    def _wait_for_new_rollouts_ready(self) -> None:
+        """
+        Calls before_new_rollouts() (rank 0 only kicks off e.g. Ray eval polling) and then
+        barriers all ranks together in a poll loop, rather than one barrier after a
+        potentially unbounded blocking wait. This keeps every NCCL collective short
+        (bounded by poll_interval_s) regardless of how long eval takes, so a slow eval
+        can no longer trip the process-group watchdog on other ranks.
+        """
+        self._callbacks.before_new_rollouts()
+
+        poll_interval_s = 30.0
+        ready = [False]
+        while not ready[0]:
+            if self._rank == 0:
+                ready[0] = self._callbacks.new_rollouts_ready()
+            dist.broadcast_object_list(ready, src=0)
+            if not ready[0]:
+                time.sleep(poll_interval_s)
+
     def _run(self) -> None:
         with barrier_guard(before=False, after=True):
             self._rank0_logger.info("Starting inference servers...")
@@ -1518,7 +1618,9 @@ class RLOOTrainer:
             # check if there is an existing checkpoint, and if so, resume from it
             if (last_checkpoint := get_last_checkpoint(self._cfg.cloud_path)) is not None:
                 last_checkpoint_local_path = self._local_path / last_checkpoint.name
-                fu.copy(last_checkpoint, last_checkpoint_local_path)
+                with barrier_guard(before=False, after=True):
+                    if self._local_rank == 0:
+                        fu.copy(last_checkpoint, last_checkpoint_local_path)
                 self._load_trainer_state(last_checkpoint_local_path)
             else:
                 last_checkpoint_local_path = None
@@ -1595,7 +1697,7 @@ class RLOOTrainer:
                 self._cfg.async_rollouts
                 and self._iterations_completed + 1 < self._cfg.params.total_iterations
             ):
-                self._callbacks.before_new_rollouts()
+                self._wait_for_new_rollouts_ready()
 
                 # request rollout generation for the next iteration right away
                 self._rollout_worker.request_rollout_generation(
@@ -1769,7 +1871,7 @@ class RLOOTrainer:
                 self._model = self._optimizer = None
 
             if not self._cfg.async_rollouts:
-                self._callbacks.before_new_rollouts()
+                self._wait_for_new_rollouts_ready()
 
                 # start new rollout generation once we finished learning
                 self._rollout_worker.request_rollout_generation(
@@ -1806,6 +1908,15 @@ class RLOOTrainer:
 
 
 def main() -> int:
+    # Convert SLURM's pre-kill SIGTERM into KeyboardInterrupt so all ranks
+    # exit through the already-guarded finally: block in run() rather than
+    # crashing with SIGABRT inside NCCL.
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        logger.warning("SIGTERM received — raising KeyboardInterrupt for clean shutdown.")
+        raise KeyboardInterrupt("SIGTERM")
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     logger.info(sys.argv[1:])
     _cfg = get_config(mode="train", overrides=sys.argv[1:])
 
@@ -1815,7 +1926,12 @@ def main() -> int:
 
     from accelerate.utils import InitProcessGroupKwargs
 
-    init_proc = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=3600))
+    # Only needs to cover the gap between two consecutive collectives; RLOOTrainer's
+    # _wait_for_new_rollouts_ready() polls EvalCallback without blocking a NCCL collective
+    # for long, so this no longer needs to bound total eval duration. Kept configurable
+    # as a safety margin.
+    nccl_timeout_s = int(os.environ.get("NCCL_TIMEOUT", 3600))
+    init_proc = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=nccl_timeout_s))
     accelerator = Accelerator(kwargs_handlers=[init_proc])
 
     setup_mixed_precision_policy(accelerator)

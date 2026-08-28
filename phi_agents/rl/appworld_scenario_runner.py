@@ -21,6 +21,7 @@ from phi_agents.evals.appworld_evals import run_vllm_inference_single_server_sin
 from phi_agents.evals.appworld_rollout_data import AppWorldRolloutData, AppWorldTrainingRollout
 from phi_agents.inference.config import AppWorldConfig
 from phi_agents.rl.type_defs import (
+    Message,
     PolicyMessage,
     PolicyTokenInfo,
     Scenario,
@@ -99,6 +100,16 @@ class MixtureAppWorldScenarioSampler(Iterator[AppWorldScenario]):
         return next(sampler)
 
 
+def compute_turn_token_spans(messages: Sequence[Message]) -> list[tuple[int, int]]:
+    lengths = [len(msg.generated_tokens) for msg in messages if isinstance(msg, PolicyMessage)]
+    spans = []
+    start = 0
+    for length in lengths:
+        spans.append((start, start + length))
+        start += length
+    return spans
+
+
 class AppWorldScenarioRunner(ScenarioRunner):
     """Runs AppWorld using a VLLM server for LLM generation."""
 
@@ -164,6 +175,7 @@ class AppWorldScenarioRunner(ScenarioRunner):
             logger.warning(f"got <|python_tag|> in rollout: {messages}")
 
         appworld_rollout_data = AppWorldRolloutData.from_episode(episode, scenario.dataset_name)
+        turn_token_spans = compute_turn_token_spans(messages)
 
         return AppWorldTrainingRollout(
             messages,
@@ -172,6 +184,8 @@ class AppWorldScenarioRunner(ScenarioRunner):
             episode.cancelled,
             PolicyTokenInfo() if episode.cancelled else llm.get_policy_token_info(messages),
             appworld_rollout_data=appworld_rollout_data,
+            turn_bookmarks=episode.turn_bookmarks,
+            turn_token_spans=turn_token_spans,
         )
 
     def cleanup(self) -> None:

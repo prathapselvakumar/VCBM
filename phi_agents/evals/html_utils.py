@@ -30,11 +30,17 @@ def rollout_summary_html(r: AppWorldTrainingRollout) -> str:
 
 
 def get_message_html(
-    msg: Message, idx: int, num_message_tokens: int, total_tokens: int, interaction: int
+    msg: Message, idx: int, num_message_tokens: int, total_tokens: int, interaction: int, is_bookmark: bool = False
 ) -> str:
+    bookmark_badge = ""
+    style_override = ""
+    if is_bookmark:
+        bookmark_badge = "<span style='background:#22c55e;color:#fff;padding:2px 6px;border-radius:4px;font-size:9px;margin-left:6px;font-weight:bold;'>CAUSAL BOOKMARK</span>"
+        style_override = "border: 2px solid #22c55e;"
+
     return f"""
-    <div class="chat-message {msg.role}">
-    <pre><p><b>{idx}: {msg.role}</b>    message tokens {num_message_tokens}    total tokens {total_tokens}    interaction {interaction}</pre></p>
+    <div class="chat-message {msg.role}" style="{style_override}">
+    <pre><p><b>{idx}: {msg.role}</b>    message tokens {num_message_tokens}    total tokens {total_tokens}    interaction {interaction}{bookmark_badge}</pre></p>
     <pre class="chat-message-content">{html.escape(msg.content)}</pre>
     </div>
     """
@@ -59,6 +65,12 @@ def get_messages_html(
         if skip_system_prompt and idx < episode.num_prompt_messages - 1:
             continue
 
+        is_bm = False
+        if getattr(episode, "turn_bookmarks", None) is not None and idx >= episode.num_prompt_messages:
+            turn_idx = (interaction_count - 1) // 2
+            if turn_idx < len(episode.turn_bookmarks):
+                is_bm = episode.turn_bookmarks[turn_idx]
+
         message_htmls.append(
             get_message_html(
                 msg,
@@ -66,6 +78,7 @@ def get_messages_html(
                 num_message_tokens=num_message_tokens,
                 total_tokens=total_tokens,
                 interaction=(interaction_count + 1) // 2,
+                is_bookmark=is_bm,
             )
         )
 

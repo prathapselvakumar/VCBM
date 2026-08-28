@@ -33,16 +33,53 @@ def locate_hf_cli() -> str | None:
     return cli_binary
 
 
+def is_offline() -> bool:
+    return (
+        os.getenv("HF_HUB_OFFLINE") == "1"
+        or os.getenv("TRANSFORMERS_OFFLINE") == "1"
+    )
+
+
+# Resolve specific HF exceptions dynamically to avoid import errors across versions
+_HF_EXPECTED_EXCEPTIONS: tuple[type[BaseException], ...] = (OSError,)
+for _exc_name in ("LocalEntryNotFoundError", "RepositoryNotFoundError", "HFValidationError", "LocalTokenNotFoundError"):
+    _exc = getattr(errors, _exc_name, None)
+    if _exc is not None:
+        _HF_EXPECTED_EXCEPTIONS += (_exc,)
+
+
 def download_model(
     name_or_path: str, hf_args: list[str] | None = None, base_dir: Path | None = None
 ) -> str:
+    if fu.exists(name_or_path):
+        return name_or_path
+
+    offline = is_offline()
+
     name_or_path_parts = Path(name_or_path).parts
     base_dir = base_dir or Path.cwd()
-    dst_name = (
-        base_dir / ".model_cache" / name_or_path_parts[-2] / name_or_path_parts[-1]
-    ).as_posix()
+    if len(name_or_path_parts) >= 2:
+        dst_name = (
+            base_dir / ".model_cache" / name_or_path_parts[-2] / name_or_path_parts[-1]
+        ).as_posix()
+    else:
+        dst_name = (base_dir / ".model_cache" / name_or_path_parts[-1]).as_posix()
 
-    if not fu.exists(name_or_path) and safe_hf_repo_exists(name_or_path):
+    if fu.exists(dst_name):
+        logger.info(f"Model already exists at local cache: {dst_name}")
+        return dst_name
+
+    # If offline mode is enabled, try to locate the model in the Hugging Face local cache.
+    if offline:
+        try:
+            from huggingface_hub import snapshot_download
+            local_dir = snapshot_download(name_or_path, local_files_only=True)
+            logger.info(f"Offline mode: located cached model for {name_or_path} at {local_dir}")
+            return local_dir
+        except Exception as e:
+            logger.warning(f"Offline mode: could not locate cached model for {name_or_path} via local_files_only: {e}")
+
+    if safe_hf_repo_exists(name_or_path):
         cmd = [
             locate_hf_cli(),
             "download",
@@ -96,8 +133,12 @@ def download_adapter(adapter_path: Path) -> Path:
 
 
 def safe_hf_repo_exists(repo_id: str) -> bool:
+    if is_offline():
+        return False
     try:
         return repo_exists(repo_id)  # type: ignore # (hf's lib doesn't have type stubs)
-    except errors.HFValidationError:
-        pass
+    except _HF_EXPECTED_EXCEPTIONS as e:
+        logger.debug(f"HF repo check skipped: {e}")
+    except Exception as e:
+        logger.warning(f"HF repo check failed unexpectedly: {e}")
     return False

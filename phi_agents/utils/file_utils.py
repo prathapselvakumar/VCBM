@@ -235,7 +235,7 @@ def copy(src_uri: Path | str, dst_uri: Path | str) -> None:
             shutil.copy(src_path, dst_path)
         else:
             safe_mkdir(Path(dst_uri).parent, exist_ok=True, parents=True)
-            shutil.copytree(src_path, dst_path)
+            shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
 
 
 def mkdir(uri_path: Path | str, parents: bool = False, exist_ok: bool = False) -> None:

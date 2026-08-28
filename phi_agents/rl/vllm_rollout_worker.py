@@ -177,8 +177,8 @@ class VLLMRolloutWorker:
             name_or_path=self._llm_cfg.base_model_path,
             base_dir=Path.cwd(),
         )
-        # Ensure all the paths are the same
-        assert len(paths) > 0 and paths == [paths[0] * len(paths)]
+        # Ensure all nodes downloaded to the same path
+        assert len(paths) > 0 and all(p == paths[0] for p in paths)
         logger.info(f"Done downloading for remote servers. got \n{paths=}")
         local_base_model_path = Path(paths[0])
 
@@ -191,15 +191,56 @@ class VLLMRolloutWorker:
             )
         return servers, local_base_model_path
 
-    def await_servers(self) -> None:
+    def await_servers(self, max_attempts: int = 3) -> None:
         if self._local_rank == 0:
             assert self._servers, f"{self._servers=} {self._local_rank=}"
 
             start = time.perf_counter()
             logger.info(f"Awaiting {len(self._servers)} servers...")
-            ray.get([server.await_startup.remote() for server in self._servers])
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    ray.get([server.await_startup.remote() for server in self._servers])
+                    break
+                except Exception:
+                    if attempt == max_attempts:
+                        raise
+                    logger.exception(
+                        f"vLLM server(s) failed to start (attempt {attempt}/{max_attempts}); "
+                        "this can happen from a transient GPU memory-profiling race with other "
+                        "processes on a shared node -- restarting the subprocess(es) and retrying."
+                    )
+                    self._restart_servers_after_failed_startup()
             elapsed = time.perf_counter() - start
             logger.info(f"Awaiting {len(self._servers)} servers...Done in {elapsed:.2f} s")
+
+    def _restart_servers_after_failed_startup(self) -> None:
+        """
+        await_startup() already stop_server()'d whichever actor(s) it failed on (best
+        effort), but stop_server() alone doesn't clear the actor's process handle, and a
+        healthy actor whose sibling failed is left alone entirely. Bring every actor to a
+        clean, process-less state, then relaunch all of them so tensor/pipeline-parallel
+        groups stay in sync.
+        """
+        assert self._servers is not None
+        assert self._local_base_model_path is not None
+
+        for server in self._servers:
+            try:
+                ray.get(server.await_termination.remote())
+            except Exception:
+                try:
+                    ray.get(server.terminate_forcefully.remote())
+                except Exception:
+                    logger.exception("Failed to forcefully terminate a wedged vLLM server actor.")
+
+        for i, server in enumerate(self._servers):
+            cpu_affinity_info = (i, len(self._servers))
+            ray.get(
+                server.start_server.remote(
+                    base_model_path=self._local_base_model_path,
+                    cpu_affinity_info=cpu_affinity_info,
+                )
+            )
 
     def _get_actor_server_name(self, port: int) -> str:
         return f"{threading.current_thread().name}_vllm_server:{port}"

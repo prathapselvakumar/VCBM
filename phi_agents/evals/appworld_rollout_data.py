@@ -7,7 +7,7 @@ import itertools
 import random
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Self
 
 import plotly.graph_objects as go
@@ -36,6 +36,7 @@ class AppWorldRolloutData:
     num_prompt_messages: int | None
     n_execution_failed: int
     n_no_code_found: int
+    turn_bookmarks: list[bool] = field(default_factory=list)
 
     @classmethod
     def from_episode(cls, episode: Episode, dataset_name: str) -> Self:
@@ -49,12 +50,15 @@ class AppWorldRolloutData:
             num_prompt_messages=episode.num_prompt_messages,
             n_execution_failed=episode.n_execution_failed,
             n_no_code_found=episode.n_no_code_found,
+            turn_bookmarks=getattr(episode, "turn_bookmarks", []),
         )
 
 
 @dataclass
 class AppWorldTrainingRollout(TrainingRollout):
     appworld_rollout_data: AppWorldRolloutData
+    turn_bookmarks: list[bool] = field(default_factory=list)
+    turn_token_spans: list[tuple[int, int]] = field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, yaml_str: str) -> "AppWorldTrainingRollout":
@@ -67,6 +71,10 @@ class AppWorldTrainingRollout(TrainingRollout):
             rollout_yaml["appworld_rollout_data"]["n_execution_failed"] = -1
         if "n_no_code_found" not in rollout_yaml["appworld_rollout_data"]:
             rollout_yaml["appworld_rollout_data"]["n_no_code_found"] = -1
+        if "turn_bookmarks" not in rollout_yaml:
+            rollout_yaml["turn_bookmarks"] = []
+        if "turn_token_spans" not in rollout_yaml:
+            rollout_yaml["turn_token_spans"] = []
         rollout = cls(**rollout_yaml)
         rollout.appworld_rollout_data = converter.structure(
             rollout.appworld_rollout_data, AppWorldRolloutData

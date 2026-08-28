@@ -293,6 +293,10 @@ class VLLMServer:
 
         if self._conf.eager_mode:
             args.append("--enforce-eager")
+            # In vLLM v1 engine (v0.10+), --enforce-eager only disables CUDA graphs
+            # but torch.compile/Inductor (level=3) still runs and requires nvcc.
+            # Explicitly set compilation level=0 to fully disable torch.compile.
+            args.append('--compilation-config={"level": 0}')
 
         logger.info(
             f"Just in case, checking if we still need to kill the process using port {str(self.port)}..."

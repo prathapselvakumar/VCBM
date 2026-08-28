@@ -5,7 +5,7 @@
 
 import json
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Self, TypedDict, cast
 
@@ -108,6 +108,7 @@ class EpisodeDict(TypedDict):
     n_execution_failed: int  # Number of turns where the code block execution failed
     n_no_code_found: int  # Number of turns where the executed code block was empty
     cancelled: bool
+    turn_bookmarks: list[bool]
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class Episode:
     n_execution_failed: int  # Number of turns where the code block execution failed
     n_no_code_found: int  # Number of turns where the executed code block was empty
     cancelled: bool
+    turn_bookmarks: list[bool] = field(default_factory=list)
 
     def asdict(self) -> EpisodeDict:
         return {
@@ -131,6 +133,7 @@ class Episode:
             "num_prompt_messages": self.num_prompt_messages,
             "n_execution_failed": self.n_execution_failed,
             "n_no_code_found": self.n_no_code_found,
+            "turn_bookmarks": self.turn_bookmarks,
         }
 
     def save(self, json_path: Path) -> None:
@@ -157,6 +160,7 @@ class Episode:
             n_execution_failed=json_data.get("n_execution_failed", -1),
             n_no_code_found=json_data.get("n_no_code_found", -1),
             cancelled=json_data.get("cancelled", False),
+            turn_bookmarks=json_data.get("turn_bookmarks", []),
         )
 
 
@@ -250,6 +254,7 @@ def _run_vllm_inference_single_server_single_task(
 
     n_execution_failed = 0
     n_no_code_found = 0
+    turn_bookmarks = []
     for interaction in range(appworld_config.env.max_interactions):
         # ask the agent to generate the code block based on the history.
         code = None
@@ -258,19 +263,24 @@ def _run_vllm_inference_single_server_single_task(
         except MaxSeqLenExceeded:
             logger.warning(f"Early stopping {task_id} after {interaction + 1} interactions")
             output = "Terminating episode: exceeded max sequence length"
+            turn_bookmarks.append(False)
             break
         except RolloutCancelled:
             logger.warning(f"Rollout for {task_id=} cancelled after {interaction + 1} interactions")
             output = "Terminating episode: cancelled"
             cancelled = True
+            turn_bookmarks.append(False)
             break
 
-        # execute the code in the world environment
+        # execute the code and detect bookmark — FAST: uses HTTP method detection
         try:
-            output = world.execute(code)
+            output, is_bookmark = world.execute_with_bookmark(code)
         except AppWorldExecutionError:
             logger.exception(f"Found AppWorldExecutionError when running code:\n{code}")
+            turn_bookmarks.append(False)
             raise
+
+        turn_bookmarks.append(is_bookmark)
 
         if no_code_found(code):
             n_no_code_found += 1
@@ -309,6 +319,7 @@ def _run_vllm_inference_single_server_single_task(
         cancelled=cancelled,
         n_execution_failed=n_execution_failed,
         n_no_code_found=n_no_code_found,
+        turn_bookmarks=turn_bookmarks,
     )
 
 
